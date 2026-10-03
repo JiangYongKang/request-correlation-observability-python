@@ -118,6 +118,11 @@ def create_app(
         snapshot["correlation_id"] = get_correlation_id()
         return snapshot
 
+    @application.get("/health")
+    async def health() -> dict[str, str]:
+        """健康检查（高频低价值入口，可用采样覆盖调低或关闭）。"""
+        return {"status": "ok", "correlation_id": get_correlation_id() or ""}
+
     return application
 
 

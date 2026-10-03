@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -31,8 +32,10 @@ from app.correlation import (
     validate_correlation_id,
 )
 from app.errors import build_safe_view
+from app.exporter import RotatingFileSpanExporter
 from app.logging_setup import configure_logging, get_logger, log_event
-from app.metrics import get_metrics
+from app.metrics import OUTCOME_CLIENT_DISCONNECTED, get_metrics, outcome_for
+from app.sampling import Sampler
 from app.tracing import FileSpanExporter, Tracer, TracerConfig
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
@@ -127,6 +130,17 @@ class ObservabilityMiddleware:
         start = time.perf_counter()
         status_holder = {"code": 500}
         response_started = {"value": False}
+        response_complete = {"value": False}
+        disconnected_early = {"value": False}
+        cancelled = {"value": False}
+        outcome_holder: dict[str, Any] = {"outcome": None, "reason": None}
+
+        async def wrapped_receive() -> dict[str, Any]:
+            message = await receive()
+            # 判定依据：响应尚未发完就收到 http.disconnect ⇒ 客户端自己走了
+            if message.get("type") == "http.disconnect" and not response_complete["value"]:
+                disconnected_early["value"] = True
+            return message
 
         async def wrapped_send(message: dict[str, Any]) -> None:
             if message["type"] == "http.response.start":
@@ -140,6 +154,8 @@ class ObservabilityMiddleware:
                     )
                 )
                 message = dict(message, headers=headers)
+            elif message["type"] == "http.response.body" and not message.get("more_body"):
+                response_complete["value"] = True
             await send(message)
 
         log_event(
@@ -151,6 +167,18 @@ class ObservabilityMiddleware:
             path=raw_path,
             correlation_id_provided=provided,
         )
+        sampling = self.tracer.sampler.decide(correlation_id, raw_path)
+        log_event(
+            _logger,
+            10,
+            "sampling_decision",
+            correlation_id=correlation_id,
+            path=raw_path,
+            sample_rate=sampling.rate,
+            sample_value=round(sampling.value, 6),
+            sample_kept=sampling.kept,
+            sample_reason=sampling.reason,
+        )
 
         try:
             with correlation_context(correlation_id):
@@ -158,12 +186,33 @@ class ObservabilityMiddleware:
                     f"{method} {raw_path}",
                     kind="server",
                     trace_id=correlation_id,
+                    sample_path=raw_path,
                     correlation_id=correlation_id,
                     method=method,
                     path=raw_path,
                 ) as root_span:
                     try:
-                        await self.app(scope, receive, wrapped_send)
+                        await self.app(scope, wrapped_receive, wrapped_send)
+                    except asyncio.CancelledError:
+                        # 判定依据：请求任务被取消（uvicorn 在客户端断连时
+                        # 取消处理任务）⇒ 客户端自己走了，不是服务端错误。
+                        cancelled["value"] = True
+                        if root_span.end_ns is None:
+                            root_span.end(
+                                "ERROR",
+                                error_type="ClientDisconnect",
+                                error_message="响应完成前客户端断开（任务被取消）",
+                            )
+                        log_event(
+                            _logger,
+                            30,
+                            "client_disconnected",
+                            correlation_id=correlation_id,
+                            method=method,
+                            path=raw_path,
+                            disconnect_reason="task_cancelled",
+                        )
+                        raise
                     except Exception as exc:  # 漏网异常：安全化 500
                         view = build_safe_view(exc, correlation_id)
                         log_event(
@@ -220,15 +269,40 @@ class ObservabilityMiddleware:
                         if matched is not None:
                             route = getattr(matched, "path", None)
                         duration_ms = (time.perf_counter() - start) * 1000
+                        # 结果分类（判定依据明确）：
+                        # - 任务被取消 / 响应发完前收到 disconnect ⇒ 客户端自己走了
+                        # - 否则按状态码推导 success/client_error/server_error
+                        if cancelled["value"]:
+                            outcome = OUTCOME_CLIENT_DISCONNECTED
+                            outcome_reason = "task_cancelled"
+                            record_status: int | None = None
+                        elif disconnected_early["value"]:
+                            outcome = OUTCOME_CLIENT_DISCONNECTED
+                            outcome_reason = "http_disconnect_before_response_complete"
+                            record_status = None
+                            if root_span.end_ns is None:
+                                root_span.end(
+                                    "ERROR",
+                                    error_type="ClientDisconnect",
+                                    error_message="响应完成前客户端断开（http.disconnect）",
+                                )
+                        else:
+                            outcome = outcome_for(status_holder["code"])
+                            outcome_reason = f"status_{status_holder['code']}"
+                            record_status = status_holder["code"]
+                        outcome_holder["outcome"] = outcome
+                        outcome_holder["reason"] = outcome_reason
                         self.metrics.record(
                             route=route,
                             method=method,
-                            status_code=status_holder["code"],
+                            status_code=record_status,
                             duration_ms=duration_ms,
+                            outcome=outcome,
                         )
                         if root_span.end_ns is None:
                             root_span.set_attribute("http.status_code", status_holder["code"])
                             root_span.set_attribute("http.route", route or "unmatched")
+                        root_span.set_attribute("http.outcome", outcome)
         finally:
             duration_ms = (time.perf_counter() - start) * 1000
             self.tracer.export_finished()
@@ -241,6 +315,8 @@ class ObservabilityMiddleware:
                 method=method,
                 status_code=status_holder["code"],
                 duration_ms=round(duration_ms, 3),
+                outcome=outcome_holder["outcome"],
+                outcome_reason=outcome_holder["reason"],
             )
 
 
@@ -255,8 +331,29 @@ def install_observability(
     configure_logging(settings.log_level)
 
     if tracer is None:
-        exporter: Any = FileSpanExporter(settings.spans_export_path)
-        tracer = Tracer(TracerConfig(sample_rate=settings.sample_rate, exporter=exporter))
+        sampler = Sampler(
+            settings.sample_rate,
+            seed=settings.sample_seed,
+            overrides=settings.sample_rate_overrides,
+        )
+        if settings.spans_export_path:
+            exporter: Any = RotatingFileSpanExporter(
+                settings.spans_export_path,
+                max_bytes=settings.spans_max_bytes,
+                max_files=settings.spans_max_files,
+                rotate_interval_s=settings.spans_rotate_interval_s,
+                queue_size=settings.spans_queue_size,
+            )
+        else:
+            exporter = FileSpanExporter("")
+        tracer = Tracer(
+            TracerConfig(
+                sample_rate=settings.sample_rate,
+                exporter=exporter,
+                sampler=sampler,
+                tail_sampling=True,
+            )
+        )
 
     metrics = get_metrics()
 
@@ -267,7 +364,13 @@ def install_observability(
         finally:
             # 进程关停：先刷指标汇总日志，再强制收尾并导出所有未完成片段
             totals = metrics.snapshot()["totals"]
-            log_event(_logger, 20, "shutdown_flush", metrics_totals=totals)
+            log_event(
+                _logger,
+                20,
+                "shutdown_flush",
+                metrics_totals=totals,
+                sampling_stats=tracer.sampling_stats(),
+            )
             tracer.shutdown()
 
     app.router.lifespan_context = lifespan
