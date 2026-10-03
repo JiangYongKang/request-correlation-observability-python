@@ -62,22 +62,34 @@ def test_exception_marks_span_with_reason():
 
 
 def test_sampling_decision_inherited_by_tree():
-    def case(rate: float) -> list[Span]:
+    """整树继承同一采样决策；比例 0 彻底不导出，比例 1 整树导出。"""
+
+    def case(rate: float) -> tuple[list[Span], list[Span]]:
         exp = InMemorySpanExporter()
         tr = Tracer(TracerConfig(sample_rate=rate, exporter=exp))
-        with tr.span("r"):
-            with tr.span("c"):
-                pass
+        captured: list[Span] = []
+        with tr.span("r") as root:
+            captured.append(root)
+            with tr.span("c") as child:
+                captured.append(child)
         tr.export_finished()
-        return exp.finished_spans()
+        return captured, exp.finished_spans()
 
-    spans = contextvars.copy_context().run(lambda: case(0.0))
-    print(f"输入=sample_rate=0.0 判定=整树 sampled=False: {[s.sampled for s in spans]}")
+    spans, exported = contextvars.copy_context().run(lambda: case(0.0))
+    print(
+        f"输入=sample_rate=0.0 判定=整树 sampled=False: {[s.sampled for s in spans]}, "
+        f"导出 {len(exported)} 条（彻底关闭）"
+    )
     assert all(not s.sampled for s in spans)
+    assert exported == []  # 比例 0：彻底不新增导出
 
-    spans = contextvars.copy_context().run(lambda: case(1.0))
-    print(f"输入=sample_rate=1.0 判定=整树 sampled=True: {[s.sampled for s in spans]}")
+    spans, exported = contextvars.copy_context().run(lambda: case(1.0))
+    print(
+        f"输入=sample_rate=1.0 判定=整树 sampled=True: {[s.sampled for s in spans]}, "
+        f"导出 {len(exported)} 条（全量）"
+    )
     assert all(s.sampled for s in spans)
+    assert len(exported) == 2  # 整树导出，不多不少
 
 
 def test_sampling_bounds_rejected():

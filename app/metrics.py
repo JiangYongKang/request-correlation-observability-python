@@ -4,12 +4,21 @@
 - ``route``：路由模板（如 ``/items/{id}``），无法解析时归为 ``"unmatched"``
 - ``method``：大写 HTTP 方法，非标准方法归为 ``"OTHER"``
 - ``status_class``：``"1xx".."5xx"`` 或 ``"unknown"``
-- ``outcome``：``"success" | "client_error" | "server_error"``
+- ``outcome``：``"success" | "client_error" | "server_error" | "client_disconnect" | "unknown"``
+
+结果分类语义（判定依据明确，不靠猜）：
+- ``success``：响应状态码 < 400；
+- ``client_error``：状态码 400–499（客户端请求本身有问题）；
+- ``server_error``：状态码 500–599 或处理中抛出未捕获异常（计入错误率）；
+- ``client_disconnect``：响应完成前客户端主动断开（判定依据：写响应时
+  连接异常、或请求任务在响应完成前被取消）。既不算成功，也不算服务端
+  错误，**不计入错误率**，避免客户端行为拉高服务端告警；
+- ``unknown``：无有效状态码且无法归类的其余场景。
 
 计数取舍（明确避免重复计数与漏计）：
 - 每个请求在中间件出口**恰好计数一次**，业务代码不直接计数；
 - 异常经由统一异常处理器转换为响应，同样在出口计数（server_error）；
-- 中途客户端断连等无响应场景计为 ``unknown`` 一次，不重计、不漏计。
+- 客户端断连计为 ``client_disconnect`` 一次，不重计、不漏计。
 
 时延使用单调时钟，单位毫秒；以计数/总和/最大值/总和平方的形式汇总，
 快照可直接得到平均时延与错误率，而不保存逐请求样本。
@@ -22,7 +31,9 @@ from dataclasses import dataclass, field
 
 _ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 _STATUS_CLASSES = frozenset({"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"})
-_OUTCOMES = frozenset({"success", "client_error", "server_error", "unknown"})
+_OUTCOMES = frozenset(
+    {"success", "client_error", "server_error", "client_disconnect", "unknown"}
+)
 
 LabelKey = tuple[str, str, str, str]
 
@@ -89,13 +100,20 @@ class RequestMetrics:
         method: str,
         status_code: int | None,
         duration_ms: float,
+        outcome: str | None = None,
     ) -> LabelKey:
-        """记录一次请求；返回归一化后的标签键。"""
+        """记录一次请求；返回归一化后的标签键。
+
+        ``outcome`` 缺省时按状态码推导；调用方可显式传入
+        （如 ``client_disconnect``：判定依据在调用点，见中间件）。
+        """
+        if outcome is not None and outcome not in _OUTCOMES:
+            raise ValueError(f"非法 outcome: {outcome!r}")
         labels = (
             normalize_route(route),
             normalize_method(method),
             status_class_for(status_code),
-            outcome_for(status_code),
+            outcome if outcome is not None else outcome_for(status_code),
         )
         with self._lock:
             agg = self._series.setdefault(labels, _Aggregate())
@@ -106,7 +124,7 @@ class RequestMetrics:
         """导出指标快照：按标签分组的计数/时延汇总与全局错误率。"""
         with self._lock:
             series: list[dict[str, object]] = []
-            total = success = client_error = server_error = 0
+            total = success = client_error = server_error = client_disconnect = 0
             for (route, method, status_class, outcome), agg in sorted(self._series.items()):
                 avg = agg.total_ms / agg.count if agg.count else 0.0
                 series.append(
@@ -129,6 +147,7 @@ class RequestMetrics:
                 success += agg.count if outcome == "success" else 0
                 client_error += agg.count if outcome == "client_error" else 0
                 server_error += agg.count if outcome == "server_error" else 0
+                client_disconnect += agg.count if outcome == "client_disconnect" else 0
             return {
                 "series": series,
                 "totals": {
@@ -136,6 +155,7 @@ class RequestMetrics:
                     "success": success,
                     "client_error": client_error,
                     "server_error": server_error,
+                    "client_disconnect": client_disconnect,
                     "error_rate": round(server_error / total, 6) if total else 0.0,
                 },
             }

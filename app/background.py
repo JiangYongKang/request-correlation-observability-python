@@ -52,10 +52,10 @@ def bind_context(
                             with tracer.span(name, kind=SPAN_KIND_BACKGROUND):
                                 return await func(*args, **kwargs)
                         finally:
-                            # 后台任务可能晚于请求结束：片段结束即导出，
-                            # 避免请求级导出先于后台片段完成而漏掉它。
+                            # 后台任务可能晚于请求结束：片段结束即收尾导出，
+                            # 避免请求级收尾先于后台片段完成而漏掉它；
+                            # 落盘由导出器缓冲与周期刷盘负责，不在此同步刷盘。
                             tracer.export_finished()
-                            tracer.exporter.flush()
                     return await func(*args, **kwargs)
 
             # 在捕获的调用方上下文中排期，追踪父栈随上下文带过去
@@ -75,7 +75,6 @@ def bind_context(
                             return func(*args, **kwargs)
                     finally:
                         tracer.export_finished()
-                        tracer.exporter.flush()
                 return func(*args, **kwargs)
 
         return ctx.run(body)

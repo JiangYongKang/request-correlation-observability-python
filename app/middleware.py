@@ -9,11 +9,20 @@
    非法时直接返回 400（``reason`` 可区分 empty/too_long/illegal_character）；
 2. 绑定上下文 + 开启根 server 片段（``trace_id`` 即关联标识，全链一致）；
 3. 透传关联标识到响应头；
-4. 无论正常/异常/流式，出口处恰好记录一次指标、导出片段并记录收尾日志。
+4. 无论正常/异常/断连/流式，出口处恰好记录一次指标并记录收尾日志；
+   片段导出由追踪器按 trace 收尾自动完成，写盘由导出器缓冲+周期落盘，
+   请求主链路不做同步刷盘。
+
+结果分类（判定依据明确）：
+- 服务端异常：``except Exception`` 捕获且非断连 ⇒ ``server_error``；
+- 客户端断连：写响应时连接异常（``send`` 抛出），或响应完成前请求任务
+  被取消（``CancelledError``）⇒ ``client_disconnect``，不算成功也不算
+  服务端错误，不计入错误率。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -127,6 +136,9 @@ class ObservabilityMiddleware:
         start = time.perf_counter()
         status_holder = {"code": 500}
         response_started = {"value": False}
+        # 断连判定依据：send 写连接失败 / 响应完成前任务被取消
+        disconnect = {"basis": None}
+        outcome_holder = {"value": None}
 
         async def wrapped_send(message: dict[str, Any]) -> None:
             if message["type"] == "http.response.start":
@@ -140,7 +152,13 @@ class ObservabilityMiddleware:
                     )
                 )
                 message = dict(message, headers=headers)
-            await send(message)
+            try:
+                await send(message)
+            except Exception as exc:
+                # 写响应时连接已断：记录判定依据后原样抛出，
+                # 由外层归类为 client_disconnect（不是服务端错误）
+                disconnect["basis"] = f"send_failed:{type(exc).__name__}"
+                raise
 
         log_event(
             _logger,
@@ -164,7 +182,52 @@ class ObservabilityMiddleware:
                 ) as root_span:
                     try:
                         await self.app(scope, receive, wrapped_send)
+                    except asyncio.CancelledError:
+                        # 响应完成前任务被取消：客户端主动断开（或进程关停）。
+                        # 判定依据写进日志与片段，指标计 client_disconnect，
+                        # 既不算成功也不混入服务端错误率。
+                        disconnect["basis"] = disconnect["basis"] or "task_cancelled_before_response_complete"
+                        outcome_holder["value"] = "client_disconnect"
+                        log_event(
+                            _logger,
+                            30,
+                            "client_disconnected",
+                            correlation_id=correlation_id,
+                            method=method,
+                            path=raw_path,
+                            basis=disconnect["basis"],
+                            response_started=response_started["value"],
+                        )
+                        if root_span.end_ns is None:
+                            root_span.set_attribute("client_disconnect", True)
+                            root_span.end(
+                                "ERROR",
+                                error_type="ClientDisconnect",
+                                error_message=disconnect["basis"],
+                            )
+                        raise
                     except Exception as exc:  # 漏网异常：安全化 500
+                        if disconnect["basis"] is not None:
+                            # 写响应时连接已断：无法回送任何响应，按断连归类
+                            outcome_holder["value"] = "client_disconnect"
+                            log_event(
+                                _logger,
+                                30,
+                                "client_disconnected",
+                                correlation_id=correlation_id,
+                                method=method,
+                                path=raw_path,
+                                basis=disconnect["basis"],
+                                response_started=response_started["value"],
+                            )
+                            if root_span.end_ns is None:
+                                root_span.set_attribute("client_disconnect", True)
+                                root_span.end(
+                                    "ERROR",
+                                    error_type="ClientDisconnect",
+                                    error_message=disconnect["basis"],
+                                )
+                            return
                         view = build_safe_view(exc, correlation_id)
                         log_event(
                             _logger,
@@ -220,19 +283,27 @@ class ObservabilityMiddleware:
                         if matched is not None:
                             route = getattr(matched, "path", None)
                         duration_ms = (time.perf_counter() - start) * 1000
+                        outcome = outcome_holder["value"]
+                        # 断连且响应未开始时无有效状态码：status_class 记 unknown，
+                        # 避免被误读为服务端 5xx
+                        code_for_metrics = status_holder["code"]
+                        if outcome == "client_disconnect" and not response_started["value"]:
+                            code_for_metrics = None
                         self.metrics.record(
                             route=route,
                             method=method,
-                            status_code=status_holder["code"],
+                            status_code=code_for_metrics,
                             duration_ms=duration_ms,
+                            outcome=outcome,
                         )
                         if root_span.end_ns is None:
                             root_span.set_attribute("http.status_code", status_holder["code"])
                             root_span.set_attribute("http.route", route or "unmatched")
         finally:
             duration_ms = (time.perf_counter() - start) * 1000
+            # 片段导出由追踪器在 trace 收尾时自动完成；此处仅兜底收尾，
+            # 不在请求主链路同步刷盘（导出器缓冲 + 周期落盘 + 关停刷盘）
             self.tracer.export_finished()
-            self.tracer.exporter.flush()
             log_event(
                 _logger,
                 20,
@@ -255,8 +326,22 @@ def install_observability(
     configure_logging(settings.log_level)
 
     if tracer is None:
-        exporter: Any = FileSpanExporter(settings.spans_export_path)
-        tracer = Tracer(TracerConfig(sample_rate=settings.sample_rate, exporter=exporter))
+        exporter: Any = FileSpanExporter(
+            settings.spans_export_path,
+            max_bytes=settings.spans_max_bytes,
+            rotate_interval_s=settings.spans_rotate_interval_s,
+            max_files=settings.spans_max_files,
+            buffer_bytes=settings.spans_buffer_bytes,
+            flush_interval_s=settings.spans_flush_interval_s,
+        )
+        tracer = Tracer(
+            TracerConfig(
+                sample_rate=settings.sample_rate,
+                exporter=exporter,
+                sample_seed=settings.sample_seed,
+                route_sample_rates=settings.route_sample_rates,
+            )
+        )
 
     metrics = get_metrics()
 
