@@ -43,6 +43,7 @@
 | `OBS_SPANS_MAX_FILES`         | `5`                | 滚动文件保留上限（含当前文件，≥1）         |
 | `OBS_SPANS_ROTATE_INTERVAL_S` | `0`                | 按时间滚动间隔（秒），0 表示不按时间滚动   |
 | `OBS_SPANS_QUEUE_SIZE`        | `10000`            | 异步写盘队列容量（背压上限）               |
+| `OBS_SPANS_FLUSH_INTERVAL_S`  | `1.0`              | 后台周期刷盘间隔（秒），0 表示不周期刷写   |
 
 非法配置值在启动期直接抛错（fail fast）。
 
@@ -90,14 +91,18 @@
 | `success`             | 响应状态码 < 400                                               |
 | `client_error`        | 状态码 400–499（客户端请求本身有问题）                         |
 | `server_error`        | 状态码 ≥ 500 或未捕获异常（计入 `error_rate`）                 |
-| `client_disconnected` | 响应完成前收到 `http.disconnect`，或请求任务被取消（CancelledError） |
+| `client_disconnected` | 响应完成前收到 `http.disconnect`；请求任务被取消（CancelledError）；或写响应中途连接已断开（`BrokenPipeError`/`ConnectionResetError`/`ClientDisconnect` 等，见 `errors.is_client_disconnect_error`） |
 
 `client_disconnected`（客户端自己走了）**既不算成功，也不计入服务端错误率**；
 日志 `request_finished` 带 `outcome` 与 `outcome_reason`
-（`task_cancelled` / `http_disconnect_before_response_complete` / `status_<code>`），
-断连还会单独记录 `client_disconnected` 事件。断连请求的根片段标记
+（`task_cancelled` / `http_disconnect_before_response_complete` /
+`response_write_failed_client_gone` / `status_<code>`），
+断连还会单独记录 `client_disconnected` 事件（带 `disconnect_reason` 与原始
+`error_type`），日志、指标、追踪三处结论一致。写响应中途断开的异常
+**被中间件吸收、不再抛给上层**（任务取消 `CancelledError` 仍按 asyncio
+语义继续传播，由服务器框架完成取消流程）。断连请求的根片段标记
 `ERROR`/`ClientDisconnect`，与服务端异常（`RuntimeError` 等）在追踪数据中可区分，
-且在采样未彻底关闭时整链保留。
+且在采样未彻底关闭时整链保留（含子片段，不会只剩半棵树）。
 
 **计数取舍**：每个请求在中间件出口**恰好计数一次**；异常经统一处理器
 转为响应同样在出口计数；非法关联标识请求记一次 `4xx/unmatched`；
@@ -151,19 +156,24 @@
 - **异步写盘**：默认导出器（`RotatingFileSpanExporter`）由后台线程落盘，
   请求主链路只做入队，不被磁盘 I/O 拖慢；队列容量 `OBS_SPANS_QUEUE_SIZE`，
   满时丢弃并计数（`exporter.stats()["dropped_spans"]`）+ 告警日志，不静默。
+- **主链路不等待落盘**：请求/流式/后台路径**不做**逐请求同步刷盘，
+  落盘（`fsync`）由写线程按 `OBS_SPANS_FLUSH_INTERVAL_S`（默认 1s）周期完成
+  ——刷写次数与请求数解耦，不随并发线性增长，尾延迟不被磁盘拖住；
+  数据可见性延迟以该间隔为上界。持续高压下队列不空也会按周期刷写。
 - **滚动**：当前文件超过 `OBS_SPANS_MAX_BYTES` 或打开时长超过
   `OBS_SPANS_ROTATE_INTERVAL_S`（>0 时）即滚动：
   `spans.jsonl` → `spans.jsonl.1` → … 序号越大越旧；文件总数（含当前）
   不超过 `OBS_SPANS_MAX_FILES`，超出部分删除，**文件不无限增长**。
-- **不丢数据**：`flush` 排空队列并 `fsync`；进程正常退出（lifespan
-  shutdown）时排空队列、`fsync`、关闭——缓冲区数据全部落盘。
+- **不丢数据**：`flush` 插入屏障并等待写线程排空队列后 `fsync`；进程正常
+  退出（lifespan shutdown）时排空队列、`fsync`、关闭——缓冲区数据全部落盘。
 - **重启可读**：文件以追加模式打开，重启后历史记录保留，逐行 JSON 可解析。
 - **链路完整**：同一次请求的片段按 trace 批量写入同一文件；跨滚动文件的
   片段可用 `trace_id` + `parent_id` 拼回完整链。
 
 ## 进程退出与数据安全
 
-- 每个请求结束即导出片段并刷盘；后台/流式片段在结束时触发所在 trace 的统一取舍；
+- 每个请求结束即把已结束片段**异步入队**导出（不等待落盘）；后台/流式片段
+  在结束时触发所在 trace 的统一取舍；落盘刷写由导出器后台线程按周期完成；
 - 关停（lifespan shutdown）时强制结束所有未完成片段
   （`status=ERROR, error_type=TracerShutdown`）并导出刷盘，**不静默丢弃**；
 - 关停日志 `shutdown_flush` 同时输出指标汇总与采样计数
@@ -178,13 +188,16 @@
   比例 1.0 时无可见差异）；
 - 默认导出文件仍为 `spans.jsonl`（追加模式），滚动参数默认值
   （64MB × 5 个文件）下行为与单文件追加一致；
-- 新增指标 `totals.client_disconnected` 默认为 0，不影响既有 `error_rate` 语义。
+- 新增指标 `totals.client_disconnected` 默认为 0，不影响既有 `error_rate` 语义；
+- 落盘方式由"逐请求同步刷盘"改为"异步入队 + 后台周期刷写
+  （默认 1s）+ 关停排空刷盘"：数据可见性延迟以刷盘间隔为上界，
+  正常退出不丢数据的保证不变。
 
 ## 本地验证
 
 ```bash
 uv sync --dev
-uv run pytest -q                 # 85 个测试（并发/异常/后台/流式/关停/采样/断连/滚动）
+uv run pytest -q                 # 93 个测试（并发/异常/后台/流式/关停/采样/断连/滚动/异步落盘）
 
 # 手动验证
 uv run uvicorn main:app --port 8000
@@ -221,6 +234,34 @@ OBS_SPANS_MAX_BYTES=1048576 OBS_SPANS_MAX_FILES=3 \
 # 同一 trace_id 的片段可用 grep 拼回完整链
 ```
 
+### 复现与验证：并发落盘不阻塞主链路
+
+```bash
+# 量化单测：慢盘（每次刷盘人为延迟 50ms）下 20 个并发请求——
+# 请求期间刷写 0 次、主链路耗时毫秒级；旧行为为 20 次刷写、耗时 ≥1s
+uv run pytest tests/test_async_export.py -q -s
+
+# 手动对照：启动后加压，观察 exporter.stats() 的 flushes 增长
+# 与请求数解耦（约每秒 1 次周期刷写），关停时统一排空刷盘
+OBS_SPANS_FLUSH_INTERVAL_S=1 uv run uvicorn main:app --port 8000
+```
+
+### 复现与验证：客户端中途断开不计服务端错误
+
+```bash
+# 断连分类单测：写响应中途断开（BrokenPipe/ConnectionReset/ClientDisconnect）
+# ⇒ client_disconnected，错误率保持 0，异常不上抛；rate=0 时不新增导出
+uv run pytest tests/test_disconnect.py -q -s
+
+# 手动复现：流式响应读到一半按 Ctrl-C 断开客户端
+uv run uvicorn main:app --port 8000
+curl -N 'localhost:8000/stream?count=100&delay_ms=200'   # 读几块后 Ctrl-C
+curl -s localhost:8000/metrics | python -m json.tool
+# totals.client_disconnected +1，server_error 与 error_rate 不变；
+# 日志可见 client_disconnected 事件与 request_finished 的 outcome_reason；
+# spans.jsonl 中该 trace 的根/流片段完整保留（ERROR/ClientDisconnect）
+```
+
 ## 目录结构
 
 ```
@@ -237,5 +278,5 @@ app/
   background.py    后台任务上下文继承
   streaming.py     流式响应上下文与片段
   main.py          应用装配与四类入口
-tests/             85 个测试（单测日志打印输入/关联标识/判定依据）
+tests/             93 个测试（单测日志打印输入/关联标识/判定依据）
 ```

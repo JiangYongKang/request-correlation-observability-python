@@ -416,12 +416,15 @@ class Tracer:
         error_message: str | None = None,
         export: bool = False,
     ) -> None:
-        """手动结束片段；``export=True`` 时立即导出已结束片段。"""
+        """手动结束片段；``export=True`` 时立即把已结束片段交给导出器。
+
+        导出为异步入队（不阻塞调用方）；落盘刷写由导出器后台周期完成，
+        显式 ``flush()`` / ``shutdown()`` 仍会同步排空并刷盘。
+        """
         span.end(status, error_type=error_type, error_message=error_message)
         self._register_finished(span)
         if export:
             self.export_finished()
-            self.exporter.flush()
 
     @contextmanager
     def span(

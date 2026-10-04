@@ -51,6 +51,35 @@ def _http_status_of(exc: BaseException) -> int | None:
     return None
 
 
+def is_client_disconnect_error(exc: BaseException) -> bool:
+    """判定异常是否为"客户端在响应写入中途主动断开"（而非服务端错误）。
+
+    判定依据（明确、不靠猜）：
+    - 连接层 ``OSError``：``BrokenPipeError`` / ``ConnectionResetError`` /
+      ``ConnectionAbortedError``（写 socket 时对端已走）；
+    - ASGI 服务器/框架的断连异常：类型名为 ``ClientDisconnect`` /
+      ``ClientDisconnected``（starlette/uvicorn 均有此约定）；
+    - ``anyio`` 资源关闭异常：``ClosedResourceError`` / ``BrokenResourceError``
+      / ``EndOfStream``（响应写入时底层流已关闭）。
+
+    以上都发生在"响应还没发完、客户端已经走了"的场景，与服务端自身
+    故障（依赖异常、代码缺陷）语义不同，必须分开归类。
+    """
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    name = type(exc).__name__
+    if name in ("ClientDisconnect", "ClientDisconnected"):
+        return True
+    module = type(exc).__module__ or ""
+    if module.startswith("anyio") and name in (
+        "ClosedResourceError",
+        "BrokenResourceError",
+        "EndOfStream",
+    ):
+        return True
+    return False
+
+
 def classify_exception(exc: BaseException) -> str:
     """把异常映射为有界的错误类型标签。"""
     from app.correlation import InvalidCorrelationIdError

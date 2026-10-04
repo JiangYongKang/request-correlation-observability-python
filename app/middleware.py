@@ -31,7 +31,7 @@ from app.correlation import (
     generate_correlation_id,
     validate_correlation_id,
 )
-from app.errors import build_safe_view
+from app.errors import build_safe_view, is_client_disconnect_error
 from app.exporter import RotatingFileSpanExporter
 from app.logging_setup import configure_logging, get_logger, log_event
 from app.metrics import OUTCOME_CLIENT_DISCONNECTED, get_metrics, outcome_for
@@ -74,6 +74,67 @@ class ObservabilityMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+    async def _handle_unhandled_exception(
+        self,
+        exc: BaseException,
+        *,
+        correlation_id: str,
+        root_span: Any,
+        response_started: dict[str, bool],
+        status_holder: dict[str, int],
+        wrapped_send: Send,
+    ) -> None:
+        """漏网异常（服务端责任）：安全化 500，计 server_error。"""
+        view = build_safe_view(exc, correlation_id)
+        log_event(
+            _logger,
+            40,
+            "unhandled_exception",
+            correlation_id=correlation_id,
+            error_code=view.code,
+            error_type=type(exc).__name__,
+        )
+        if root_span.end_ns is None:
+            root_span.set_attribute("error", True)
+        if not response_started["value"]:
+            status_holder["code"] = view.status_code
+            root_span.end(
+                "ERROR",
+                error_type=type(exc).__name__,
+                error_message=view.message,
+            )
+            await self._send_json(
+                wrapped_send,
+                view.status_code,
+                {"error": {
+                    "code": view.code,
+                    "message": view.message,
+                    "correlation_id": correlation_id,
+                }},
+            )
+        else:
+            # 响应已开始（流式中途异常）：HTTP 状态码无法更改，
+            # 但要保证可观测结论一致：根片段标 ERROR、指标记 5xx，
+            # 并发送终止帧干净收尾（客户端观察到流被截断），
+            # 不让依赖库异常穿透到服务端。
+            status_holder["code"] = 500
+            root_span.end(
+                "ERROR",
+                error_type=type(exc).__name__,
+                error_message=view.message,
+            )
+            log_event(
+                _logger,
+                40,
+                "response_aborted_after_start",
+                correlation_id=correlation_id,
+                error_code=view.code,
+                error_type=type(exc).__name__,
+            )
+            await wrapped_send(
+                {"type": "http.response.body", "body": b"", "more_body": False}
+            )
 
     async def __call__(self, scope: dict[str, Any], receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -133,6 +194,8 @@ class ObservabilityMiddleware:
         response_complete = {"value": False}
         disconnected_early = {"value": False}
         cancelled = {"value": False}
+        # 断连判定依据（用于日志与指标 outcome_reason，三处结论一致）
+        disconnect_reason = {"value": "http_disconnect_before_response_complete"}
         outcome_holder: dict[str, Any] = {"outcome": None, "reason": None}
 
         async def wrapped_receive() -> dict[str, Any]:
@@ -213,55 +276,41 @@ class ObservabilityMiddleware:
                             disconnect_reason="task_cancelled",
                         )
                         raise
-                    except Exception as exc:  # 漏网异常：安全化 500
-                        view = build_safe_view(exc, correlation_id)
-                        log_event(
-                            _logger,
-                            40,
-                            "unhandled_exception",
-                            correlation_id=correlation_id,
-                            error_code=view.code,
-                            error_type=type(exc).__name__,
-                        )
-                        if root_span.end_ns is None:
-                            root_span.set_attribute("error", True)
-                        if not response_started["value"]:
-                            status_holder["code"] = view.status_code
-                            root_span.end(
-                                "ERROR",
-                                error_type=type(exc).__name__,
-                                error_message=view.message,
-                            )
-                            await self._send_json(
-                                wrapped_send,
-                                view.status_code,
-                                {"error": {
-                                    "code": view.code,
-                                    "message": view.message,
-                                    "correlation_id": correlation_id,
-                                }},
-                            )
-                        else:
-                            # 响应已开始（流式中途异常）：HTTP 状态码无法更改，
-                            # 但要保证可观测结论一致：根片段标 ERROR、指标记 5xx，
-                            # 并发送终止帧干净收尾（客户端观察到流被截断），
-                            # 不让依赖库异常穿透到服务端。
-                            status_holder["code"] = 500
-                            root_span.end(
-                                "ERROR",
-                                error_type=type(exc).__name__,
-                                error_message=view.message,
-                            )
+                    except Exception as exc:
+                        if is_client_disconnect_error(exc):
+                            # 判定依据：写响应时底层连接已断开（对端主动走了）
+                            # ⇒ client_disconnected，不是服务端错误：
+                            # 不计 5xx、不抬高错误率、不再向上抛、不再尝试写响应。
+                            disconnected_early["value"] = True
+                            disconnect_reason["value"] = "response_write_failed_client_gone"
+                            if root_span.end_ns is None:
+                                root_span.end(
+                                    "ERROR",
+                                    error_type="ClientDisconnect",
+                                    error_message=(
+                                        "响应写入时客户端已断开"
+                                        f"（{type(exc).__name__}）"
+                                    ),
+                                )
                             log_event(
                                 _logger,
-                                40,
-                                "response_aborted_after_start",
+                                30,
+                                "client_disconnected",
                                 correlation_id=correlation_id,
-                                error_code=view.code,
+                                method=method,
+                                path=raw_path,
+                                disconnect_reason="response_write_failed_client_gone",
                                 error_type=type(exc).__name__,
                             )
-                            await wrapped_send(
-                                {"type": "http.response.body", "body": b"", "more_body": False}
+                        else:
+                            # 漏网异常（服务端责任）：安全化 500，计 server_error
+                            await self._handle_unhandled_exception(
+                                exc,
+                                correlation_id=correlation_id,
+                                root_span=root_span,
+                                response_started=response_started,
+                                status_holder=status_holder,
+                                wrapped_send=wrapped_send,
                             )
                     finally:
                         route = None
@@ -278,7 +327,7 @@ class ObservabilityMiddleware:
                             record_status: int | None = None
                         elif disconnected_early["value"]:
                             outcome = OUTCOME_CLIENT_DISCONNECTED
-                            outcome_reason = "http_disconnect_before_response_complete"
+                            outcome_reason = disconnect_reason["value"]
                             record_status = None
                             if root_span.end_ns is None:
                                 root_span.end(
@@ -305,8 +354,9 @@ class ObservabilityMiddleware:
                         root_span.set_attribute("http.outcome", outcome)
         finally:
             duration_ms = (time.perf_counter() - start) * 1000
+            # 只把已结束片段交给导出器（入队即返回）；落盘刷写由导出器
+            # 后台线程按周期完成，请求主链路不同步等待磁盘 I/O。
             self.tracer.export_finished()
-            self.tracer.exporter.flush()
             log_event(
                 _logger,
                 20,
@@ -343,6 +393,7 @@ def install_observability(
                 max_files=settings.spans_max_files,
                 rotate_interval_s=settings.spans_rotate_interval_s,
                 queue_size=settings.spans_queue_size,
+                flush_interval_s=settings.spans_flush_interval_s,
             )
         else:
             exporter = FileSpanExporter("")

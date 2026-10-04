@@ -9,7 +9,8 @@
 - ``stream`` 片段继承请求根片段的 ``trace_id`` / ``parent_id``；
 - 正常结束标记 ``OK``；生产者异常标记 ``ERROR`` 并保留原因；
   消费端提前断连（``GeneratorExit``）标记 ``ERROR``/``CancelledError``；
-- 片段结束后立即导出刷盘，避免响应结束、进程退出时流式片段丢失。
+- 片段结束后立即异步入队导出（刷盘由导出器后台周期完成，
+  关停时统一排空刷盘），避免响应结束、进程退出时流式片段丢失。
 """
 
 from __future__ import annotations

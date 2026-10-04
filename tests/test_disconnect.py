@@ -182,3 +182,175 @@ def test_disconnect_not_exported_when_sampling_disabled():
     assert exporter.finished_spans() == []
     assert stats["traces_dropped"] == 1
     assert metrics.snapshot()["totals"]["client_disconnected"] == 1
+
+
+class _FailOnSecondBody:
+    """前两条响应消息正常，第二条 body 开始抛出指定异常（模拟写盘时客户端已走）。"""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.messages: list[dict] = []
+        self._body_count = 0
+        self._exc = exc
+
+    async def __call__(self, message: dict) -> None:
+        self.messages.append(message)
+        if message["type"] == "http.response.body":
+            self._body_count += 1
+            if self._body_count >= 2:
+                raise self._exc
+
+
+class ClientDisconnect(Exception):
+    """模拟 starlette/uvicorn 的同名断连异常（按类型名识别）。"""
+
+
+async def _two_chunk_app(scope, receive, send):
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"chunk-1", "more_body": True})
+    await send({"type": "http.response.body", "body": b"chunk-2", "more_body": False})
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: BrokenPipeError(32, "Broken pipe"),
+        lambda: ConnectionResetError(104, "Connection reset by peer"),
+        lambda: ClientDisconnect("client gone"),
+    ],
+    ids=["broken_pipe", "connection_reset", "client_disconnect_class"],
+)
+def test_disconnect_during_response_write_classified(list_handler, exc_factory):
+    """写响应中途客户端断开 ⇒ client_disconnected：不算成功、不进错误率、异常不上抛。"""
+    mw, tracer, exporter, metrics = _make_middleware(_two_chunk_app)
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request"}
+
+    send = _FailOnSecondBody(exc_factory())
+    exc = send._exc
+    # 关键断言 0：异常不再抛给上层（调用正常返回）
+    asyncio.run(mw(_scope("/stream"), receive, send))
+    totals = metrics.snapshot()["totals"]
+    spans = exporter.finished_spans()
+    events = {p.get("event"): p for p in list_handler.payloads()}
+    print(
+        f"输入=第二块 body 写入抛 {type(exc).__name__} 关联标识={spans[0].trace_id if spans else None} "
+        f"判定=outcome=client_disconnected(response_write_failed_client_gone)，"
+        f"错误率={totals['error_rate']}，片段={spans[0].status if spans else None}/"
+        f"{spans[0].error_type if spans else None}"
+    )
+    # 指标：不算成功，也不计入服务端错误率
+    assert totals["client_disconnected"] == 1
+    assert totals["success"] == 0
+    assert totals["server_error"] == 0
+    assert totals["error_rate"] == 0.0
+    # 追踪：根片段标 ClientDisconnect，与服务端异常可区分；采样未关 ⇒ 整链保留
+    assert len(spans) == 1
+    assert spans[0].status == "ERROR" and spans[0].error_type == "ClientDisconnect"
+    # 日志：三处结论一致（断连事件 + 收尾事件同一判定依据）
+    assert events["client_disconnected"]["disconnect_reason"] == "response_write_failed_client_gone"
+    assert events["client_disconnected"]["error_type"] == type(exc).__name__
+    assert events["request_finished"]["outcome"] == "client_disconnected"
+    assert events["request_finished"]["outcome_reason"] == "response_write_failed_client_gone"
+
+
+def test_disconnect_write_failure_trace_tree_complete(list_handler):
+    """断连时整棵树一起留下：根+子片段同 trace、父子对得上，不是半棵树。"""
+    exporter = InMemorySpanExporter()
+    tracer = Tracer(TracerConfig(sample_rate=1.0, exporter=exporter, tail_sampling=True))
+    metrics = RequestMetrics()
+    settings = ObservabilitySettings(spans_export_path="")
+
+    async def app(scope, receive, send):
+        with tracer.span("db-query"):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"c1", "more_body": True})
+        await send({"type": "http.response.body", "body": b"c2", "more_body": False})
+
+    mw = ObservabilityMiddleware(app, settings=settings, tracer=tracer, metrics=metrics)
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request"}
+
+    asyncio.run(mw(_scope("/stream"), receive, _FailOnSecondBody(BrokenPipeError())))
+    spans = exporter.finished_spans()
+    by_name = {s.name: s for s in spans}
+    print(
+        f"输入=根+子两片断树写中途断连 关联标识={spans[0].trace_id if spans else None} "
+        f"判定=导出 {len(spans)} 条，父子完整"
+    )
+    assert len(spans) == 2  # 整树保留，不是半棵
+    root = next(s for s in spans if s.parent_id is None)
+    child = by_name["db-query"]
+    assert child.parent_id == root.span_id  # 父子对得上
+    assert child.trace_id == root.trace_id
+    assert root.status == "ERROR" and root.error_type == "ClientDisconnect"
+    assert child.status == "OK"
+
+
+def test_disconnect_write_failure_retained_when_sampled_out():
+    """采样未彻底关闭（0<rate<1）且本 trace 未抽中：断连样本仍整链保留。"""
+    from app.sampling import Sampler
+
+    sampler = Sampler(0.5)  # 与 TracerConfig(sample_rate=0.5) 同默认种子
+    cid = next(
+        c for c in (f"cid-candidate-{i}" for i in range(1000))
+        if not sampler.decide(c, "/slow").kept
+    )
+    exporter = InMemorySpanExporter()
+    tracer = Tracer(TracerConfig(sample_rate=0.5, exporter=exporter, tail_sampling=True))
+    metrics = RequestMetrics()
+    settings = ObservabilitySettings(spans_export_path="")
+    mw = ObservabilityMiddleware(_two_chunk_app, settings=settings, tracer=tracer, metrics=metrics)
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http", "method": "GET", "path": "/slow",
+        "headers": [(b"x-correlation-id", cid.encode("latin-1"))], "state": {},
+    }
+    asyncio.run(mw(scope, receive, _FailOnSecondBody(BrokenPipeError())))
+    spans = exporter.finished_spans()
+    stats = tracer.sampling_stats()
+    print(
+        f"输入=rate=0.5 且 {cid} 未抽中 + 写中途断连 "
+        f"判定=失败保留导出 {len(spans)} 条，kept_for_error={stats['traces_kept_for_error']}"
+    )
+    assert len(spans) == 1  # 未抽中但断连 ⇒ 强制保留
+    assert spans[0].trace_id == cid
+    assert spans[0].error_type == "ClientDisconnect"
+    assert stats["traces_kept_for_error"] == 1
+    assert metrics.snapshot()["totals"]["client_disconnected"] == 1
+
+
+def test_disconnect_write_failure_not_exported_when_sampling_disabled(list_handler):
+    """采样彻底关闭（rate=0）：写中途断连也不新增导出，只留计数与日志。"""
+    exporter = InMemorySpanExporter()
+    tracer = Tracer(TracerConfig(sample_rate=0.0, exporter=exporter, tail_sampling=True))
+    metrics = RequestMetrics()
+    settings = ObservabilitySettings(spans_export_path="")
+    mw = ObservabilityMiddleware(_two_chunk_app, settings=settings, tracer=tracer, metrics=metrics)
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request"}
+
+    asyncio.run(mw(_scope(), receive, _FailOnSecondBody(BrokenPipeError())))
+    stats = tracer.sampling_stats()
+    totals = metrics.snapshot()["totals"]
+    events = {p.get("event"): p for p in list_handler.payloads()}
+    print(
+        f"输入=rate=0 + 写中途断连 判定=导出 0 条，dropped={stats['traces_dropped']}，"
+        f"指标 client_disconnected={totals['client_disconnected']}，"
+        f"日志 outcome={events['request_finished']['outcome']}"
+    )
+    assert exporter.finished_spans() == []  # 不新增任何导出
+    assert stats["traces_dropped"] == 1
+    assert totals["client_disconnected"] == 1  # 计数仍在
+    assert totals["server_error"] == 0 and totals["error_rate"] == 0.0
+    assert events["request_finished"]["outcome"] == "client_disconnected"
+    assert events["client_disconnected"]["disconnect_reason"] == "response_write_failed_client_gone"
