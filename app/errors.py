@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -154,4 +155,48 @@ def log_exception(
         exc_info=exc if view.status_code >= 500 else None,
     )
     return view
+
+
+# 对端关闭连接时各层可能抛出的异常模块（惰性识别，避免导入期硬依赖）：
+# - asyncio.CancelledError：uvicorn 在连接关闭等场景取消请求任务
+# - ConnectionResetError / BrokenPipeError（均为 OSError 子类）：传输层写对端
+#   已关闭的 socket
+# - uvicorn.protocols.utils.ClientDisconnected：uvicorn 自己的断连标记
+# - starlette.requests.ClientDisconnect：读取请求体时对端已走
+# - h11._util.RemoteProtocolError / h2.exceptions.StreamClosedError 等：
+#   协议层发现对端已关闭（写响应中途断开的典型表现）
+_CLIENT_GONE_MODULE_PREFIXES = ("h11.", "h2.", "httpcore.")
+_CLIENT_GONE_MODULE_NAMES = {
+    "uvicorn.protocols.utils.ClientDisconnected",
+    "starlette.requests.ClientDisconnect",
+}
+_CLIENT_GONE_TYPE_NAMES = {
+    "StreamClosedError",
+    "StreamResetError",
+    "RemoteProtocolError",
+}
+
+
+def is_client_disconnect(exc: BaseException) -> bool:
+    """判断异常是否表示"客户端主动走了"（对端关闭），而非服务端出错。
+
+    判定依据（命中任一即视为客户端断连）：
+    1. ``asyncio.CancelledError``——请求任务被取消（典型为客户端断连
+       导致 uvicorn 取消处理任务）；
+    2. ``ConnectionResetError`` / ``BrokenPipeError``——写已关闭连接；
+    3. 已知 HTTP/协议库的"对端关闭"异常类型（h11/h2/uvicorn/starlette）。
+
+    刻意**不**按消息文本匹配，避免把服务端自身的协议错误误判为断连。
+    """
+    if isinstance(exc, (asyncio.CancelledError, ConnectionResetError, BrokenPipeError)):
+        return True
+    module = type(exc).__module__
+    qualname = f"{module}.{type(exc).__name__}"
+    if qualname in _CLIENT_GONE_MODULE_NAMES:
+        return True
+    if module.startswith(_CLIENT_GONE_MODULE_PREFIXES) and type(exc).__name__ in (
+        _CLIENT_GONE_TYPE_NAMES
+    ):
+        return True
+    return False
 

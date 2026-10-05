@@ -31,7 +31,7 @@ from app.correlation import (
     generate_correlation_id,
     validate_correlation_id,
 )
-from app.errors import build_safe_view
+from app.errors import build_safe_view, is_client_disconnect
 from app.exporter import RotatingFileSpanExporter
 from app.logging_setup import configure_logging, get_logger, log_event
 from app.metrics import OUTCOME_CLIENT_DISCONNECTED, get_metrics, outcome_for
@@ -132,17 +132,28 @@ class ObservabilityMiddleware:
         response_started = {"value": False}
         response_complete = {"value": False}
         disconnected_early = {"value": False}
+        disconnect_reason_holder: dict[str, str] = {}
         cancelled = {"value": False}
         outcome_holder: dict[str, Any] = {"outcome": None, "reason": None}
+
+        def _mark_client_gone(reason: str) -> None:
+            """标记客户端在响应完成前主动断开（三处结论共用同一判定）。"""
+            disconnected_early["value"] = True
+            disconnect_reason_holder["value"] = reason
 
         async def wrapped_receive() -> dict[str, Any]:
             message = await receive()
             # 判定依据：响应尚未发完就收到 http.disconnect ⇒ 客户端自己走了
             if message.get("type") == "http.disconnect" and not response_complete["value"]:
-                disconnected_early["value"] = True
+                _mark_client_gone("http_disconnect_before_response_complete")
             return message
 
         async def wrapped_send(message: dict[str, Any]) -> None:
+            # 末帧标记在发送成功后才置位：末帧本身发送失败（对端已走）
+            # 仍属于"响应完成前断开"，必须按客户端断连收口。
+            is_final_body = (
+                message["type"] == "http.response.body" and not message.get("more_body")
+            )
             if message["type"] == "http.response.start":
                 response_started["value"] = True
                 status_holder["code"] = int(message.get("status", 500))
@@ -154,9 +165,19 @@ class ObservabilityMiddleware:
                     )
                 )
                 message = dict(message, headers=headers)
-            elif message["type"] == "http.response.body" and not message.get("more_body"):
-                response_complete["value"] = True
-            await send(message)
+            try:
+                await send(message)
+            except BaseException as exc:
+                # 判定依据：写响应（含流式中途/末帧）时对端已关闭 ⇒ 客户端
+                # 自己走了，不是服务端错误。标记后以 CancelledError 中断剩余
+                # 处理，由外层统一收尾：不计数错误率、不向上抛。
+                if is_client_disconnect(exc):
+                    _mark_client_gone(f"send_failed_client_gone:{type(exc).__name__}")
+                    raise asyncio.CancelledError() from exc
+                raise
+            else:
+                if is_final_body:
+                    response_complete["value"] = True
 
         log_event(
             _logger,
@@ -195,8 +216,12 @@ class ObservabilityMiddleware:
                         await self.app(scope, wrapped_receive, wrapped_send)
                     except asyncio.CancelledError:
                         # 判定依据：请求任务被取消（uvicorn 在客户端断连时
-                        # 取消处理任务）⇒ 客户端自己走了，不是服务端错误。
+                        # 取消处理任务）或写响应时对端已关闭 ⇒ 客户端自己走了，
+                        # 不是服务端错误。**不再向上抛**：中间件干净收尾，
+                        # 由外层 finally 统一记录指标/日志/追踪。
                         cancelled["value"] = True
+                        if not disconnected_early["value"]:
+                            _mark_client_gone("task_cancelled")
                         if root_span.end_ns is None:
                             root_span.end(
                                 "ERROR",
@@ -210,9 +235,12 @@ class ObservabilityMiddleware:
                             correlation_id=correlation_id,
                             method=method,
                             path=raw_path,
-                            disconnect_reason="task_cancelled",
+                            disconnect_reason=disconnect_reason_holder.get(
+                                "value", "task_cancelled"
+                            ),
                         )
-                        raise
+                        # 注意：不 re-raise。客户端断连是正常连接生命周期事件，
+                        # 不应作为服务端错误穿透到上层。
                     except Exception as exc:  # 漏网异常：安全化 500
                         view = build_safe_view(exc, correlation_id)
                         log_event(
@@ -260,9 +288,34 @@ class ObservabilityMiddleware:
                                 error_code=view.code,
                                 error_type=type(exc).__name__,
                             )
-                            await wrapped_send(
-                                {"type": "http.response.body", "body": b"", "more_body": False}
-                            )
+                            try:
+                                await wrapped_send(
+                                    {"type": "http.response.body", "body": b"", "more_body": False}
+                                )
+                            except asyncio.CancelledError:
+                                # 发终止帧时也发现客户端走了（wrapped_send 已按
+                                # 对端关闭判定并转换）：按断连收口，覆盖 5xx 结论
+                                cancelled["value"] = True
+                                root_span.reclassify_as_client_disconnect()
+                                log_event(
+                                    _logger,
+                                    30,
+                                    "client_disconnected",
+                                    correlation_id=correlation_id,
+                                    method=method,
+                                    path=raw_path,
+                                    disconnect_reason=disconnect_reason_holder.get(
+                                        "value", "send_failed_client_gone"
+                                    ),
+                                )
+                            except Exception:
+                                # 终止帧仍是服务端侧错误：保持 server_error 结论
+                                log_event(
+                                    _logger,
+                                    40,
+                                    "terminator_send_failed",
+                                    correlation_id=correlation_id,
+                                )
                     finally:
                         route = None
                         matched = scope.get("route")
@@ -270,21 +323,20 @@ class ObservabilityMiddleware:
                             route = getattr(matched, "path", None)
                         duration_ms = (time.perf_counter() - start) * 1000
                         # 结果分类（判定依据明确）：
-                        # - 任务被取消 / 响应发完前收到 disconnect ⇒ 客户端自己走了
+                        # - 任务被取消 / 响应发完前 send 失败 / 提前收到 disconnect
+                        #   ⇒ 客户端自己走了
                         # - 否则按状态码推导 success/client_error/server_error
-                        if cancelled["value"]:
+                        if cancelled["value"] or disconnected_early["value"]:
                             outcome = OUTCOME_CLIENT_DISCONNECTED
-                            outcome_reason = "task_cancelled"
+                            outcome_reason = disconnect_reason_holder.get(
+                                "value", "task_cancelled"
+                            )
                             record_status: int | None = None
-                        elif disconnected_early["value"]:
-                            outcome = OUTCOME_CLIENT_DISCONNECTED
-                            outcome_reason = "http_disconnect_before_response_complete"
-                            record_status = None
                             if root_span.end_ns is None:
                                 root_span.end(
                                     "ERROR",
                                     error_type="ClientDisconnect",
-                                    error_message="响应完成前客户端断开（http.disconnect）",
+                                    error_message="响应完成前客户端断开",
                                 )
                         else:
                             outcome = outcome_for(status_holder["code"])
@@ -305,8 +357,9 @@ class ObservabilityMiddleware:
                         root_span.set_attribute("http.outcome", outcome)
         finally:
             duration_ms = (time.perf_counter() - start) * 1000
+            # 片段仅入队导出，**不在请求链路同步刷盘**：落盘由写线程批量处理，
+            # 写盘开销不随请求数线性增长；进程关停时 lifespan 统一 flush 屏障。
             self.tracer.export_finished()
-            self.tracer.exporter.flush()
             log_event(
                 _logger,
                 20,
@@ -343,6 +396,8 @@ def install_observability(
                 max_files=settings.spans_max_files,
                 rotate_interval_s=settings.spans_rotate_interval_s,
                 queue_size=settings.spans_queue_size,
+                autoflush_interval_s=settings.spans_autoflush_interval_s,
+                fsync_interval_s=settings.spans_fsync_interval_s,
             )
         else:
             exporter = FileSpanExporter("")

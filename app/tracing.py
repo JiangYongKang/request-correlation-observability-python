@@ -87,6 +87,17 @@ class Span:
         self.error_type = error_type
         self.error_message = error_message
 
+    def reclassify_as_client_disconnect(self) -> None:
+        """把已按服务端异常结束的片段改判为客户端断连。
+
+        用于"响应已开始、已按 5xx 结束根片段后，发终止帧时才发现对端已
+        关闭"的边界：保证指标/日志/追踪三处结论一致为 client_disconnected。
+        """
+        self.status = _STATUS_ERROR
+        self.error_type = "ClientDisconnect"
+        self.error_message = "响应完成前客户端断开"
+        self.attributes.pop("error", None)
+
     def to_dict(self) -> dict[str, Any]:
         """序列化为可导出字典。"""
         return {
@@ -416,12 +427,12 @@ class Tracer:
         error_message: str | None = None,
         export: bool = False,
     ) -> None:
-        """手动结束片段；``export=True`` 时立即导出已结束片段。"""
+        """手动结束片段；``export=True`` 时立即把已结束片段导出（仅入队，
+        不同步刷盘——落盘由导出器写线程批量处理，避免拖住业务链路）。"""
         span.end(status, error_type=error_type, error_message=error_message)
         self._register_finished(span)
         if export:
             self.export_finished()
-            self.exporter.flush()
 
     @contextmanager
     def span(

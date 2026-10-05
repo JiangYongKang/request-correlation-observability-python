@@ -15,6 +15,8 @@
 - ``OBS_SPANS_MAX_FILES``：滚动文件保留上限（含当前文件）
 - ``OBS_SPANS_ROTATE_INTERVAL_S``：按时间滚动间隔（秒），0 表示不按时间滚动
 - ``OBS_SPANS_QUEUE_SIZE``：异步写盘队列容量（背压上限）
+- ``OBS_SPANS_AUTOFLUSH_INTERVAL_S``：写线程把 OS 缓冲 flush 的周期（秒，0 关闭）
+- ``OBS_SPANS_FSYNC_INTERVAL_S``：写线程 fsync 的最长间隔（秒，0 表示不周期 fsync）
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ DEFAULT_SPANS_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_SPANS_MAX_FILES = 5
 DEFAULT_SPANS_ROTATE_INTERVAL_S = 0.0
 DEFAULT_SPANS_QUEUE_SIZE = 10000
+DEFAULT_SPANS_AUTOFLUSH_INTERVAL_S = 0.2
+DEFAULT_SPANS_FSYNC_INTERVAL_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,8 @@ class ObservabilitySettings:
     spans_max_files: int = DEFAULT_SPANS_MAX_FILES
     spans_rotate_interval_s: float = DEFAULT_SPANS_ROTATE_INTERVAL_S
     spans_queue_size: int = DEFAULT_SPANS_QUEUE_SIZE
+    spans_autoflush_interval_s: float = DEFAULT_SPANS_AUTOFLUSH_INTERVAL_S
+    spans_fsync_interval_s: float = DEFAULT_SPANS_FSYNC_INTERVAL_S
 
     def __post_init__(self) -> None:
         if not self.correlation_header.strip():
@@ -73,6 +79,10 @@ class ObservabilitySettings:
             raise ValueError("spans_rotate_interval_s 不能为负")
         if self.spans_queue_size < 1:
             raise ValueError("spans_queue_size 至少为 1")
+        if self.spans_autoflush_interval_s < 0:
+            raise ValueError("spans_autoflush_interval_s 不能为负")
+        if self.spans_fsync_interval_s < 0:
+            raise ValueError("spans_fsync_interval_s 不能为负")
 
 
 def _log_level_from_env(raw: str | None) -> int:
@@ -96,6 +106,14 @@ def get_settings() -> ObservabilitySettings:
         os.environ.get("OBS_SPANS_ROTATE_INTERVAL_S", str(DEFAULT_SPANS_ROTATE_INTERVAL_S))
     )
     queue_size = int(os.environ.get("OBS_SPANS_QUEUE_SIZE", str(DEFAULT_SPANS_QUEUE_SIZE)))
+    autoflush_interval_s = float(
+        os.environ.get(
+            "OBS_SPANS_AUTOFLUSH_INTERVAL_S", str(DEFAULT_SPANS_AUTOFLUSH_INTERVAL_S)
+        )
+    )
+    fsync_interval_s = float(
+        os.environ.get("OBS_SPANS_FSYNC_INTERVAL_S", str(DEFAULT_SPANS_FSYNC_INTERVAL_S))
+    )
     return ObservabilitySettings(
         correlation_header=header,
         correlation_max_length=max_length,
@@ -108,4 +126,6 @@ def get_settings() -> ObservabilitySettings:
         spans_max_files=max_files,
         spans_rotate_interval_s=rotate_interval,
         spans_queue_size=queue_size,
+        spans_autoflush_interval_s=autoflush_interval_s,
+        spans_fsync_interval_s=fsync_interval_s,
     )
